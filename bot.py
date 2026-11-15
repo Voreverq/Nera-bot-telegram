@@ -346,7 +346,7 @@ def format_start_text(user_first_name: str, user_id: int) -> Tuple[str, bool]:
 
     text = (
         f"Halo, <b>{name}</b>! 👋\n"
-        f"Selamat datang di <b>Bot AI Dual-Backend</b>.\n\n"
+        f"Selamat datang di <b>Nera, Bot AI Dual-Backend</b>.\n\n"
         f"📡 <b>Status Sistem Saat Ini:</b>\n"
         f"{backend_status}\n\n"
         f"💡 <b>Fitur Tersedia:</b>\n"
