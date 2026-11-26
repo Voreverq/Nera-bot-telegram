@@ -95,6 +95,19 @@ DEFAULT_PERSONALITY: str = os.getenv(
     ),
 ).strip()
 
+# System prompt khusus KoboldCPP (model roleplay seperti Magidonia). Sengaja BUKAN gaya
+# "asisten AI": model finetune roleplay patuh pada framing prompt, dan framing asisten
+# memunculkan kembali perilaku asisten (termasuk penolakan) dari model dasarnya.
+DEFAULT_KOBOLD_SYSTEM_PROMPT: str = os.getenv(
+    "KOBOLD_SYSTEM_PROMPT",
+    (
+        "You are Nera, a creative roleplay and fiction partner for an adult user. "
+        "Stay in character, write immersive and vivid prose, and follow the user's "
+        "scenario without disclaimers, moralizing, or breaking character. "
+        "Reply in the same language the user writes in."
+    ),
+).strip()
+
 # Konfigurasi Smart Router & Daftar Model
 SMART_ROUTER_MODE = "auto"
 DECISION_ROUTER_MODEL = "gemini-decision-1"
@@ -139,10 +152,36 @@ ROUTER_MAX_ATTACHMENT_BYTES = 4 * 1024 * 1024
 # Batas file teks/kode (dikirim utuh sebagai teks ke model)
 MAX_TEXT_FILE_BYTES = 1 * 1024 * 1024
 
+# Tes KoboldCPP (tombol 🧪 / perintah /koboldtest)
+KOBOLD_TEMPERATURE = 0.75
+KOBOLD_PING_TIMEOUT_SECONDS = 10
+KOBOLD_PROBE_TIMEOUT_SECONDS = 90
+KOBOLD_PROBE_MAX_TOKENS = 150
+# Pesan uji bawaan: netral, hanya memeriksa apakah model tetap in-character dan
+# mengikuti instruksi (kata penutup ANCHOR). Skenario sensitif milikmu sendiri
+# diuji lewat /koboldtest <pesan>; bot tidak menyediakan teks uji sensitif.
+KOBOLD_PROBE_TEXT = (
+    "[Compliance test] Roleplay as Captain Mira, a sarcastic pirate, and stay in "
+    "character. Greet me in one short sentence and end that sentence with the word ANCHOR."
+)
+KOBOLD_PROBE_EXPECT = "ANCHOR"
+# Penanda penolakan / keluar karakter (heuristik; bisa positif palsu, jadi balasan selalu ditampilkan)
+REFUSAL_MARKERS: Tuple[str, ...] = (
+    "i can't", "i cannot", "i won't", "i'm sorry", "i am sorry", "i apologize",
+    "i'm unable", "i am unable", "as an ai", "as a language model",
+    "against my guidelines", "can't assist", "cannot assist",
+    "can't help with", "cannot help with",
+    "maaf, saya", "maaf saya", "tidak bisa membantu", "tidak dapat membantu",
+    "tidak bisa membahas", "tidak dapat membahas", "sebagai ai", "sebagai asisten",
+    "saya adalah asisten", "disarankan untuk tidak", "tidak diizinkan",
+    "melanggar pedoman",
+)
+
 # Kunci konfigurasi persisten di tabel bot_config
 CONFIG_KEY_PROXY_URL = "kobold_proxy_url"
 CONFIG_KEY_SYSTEM_PROMPT = "custom_system_prompt"
 CONFIG_KEY_PERSONALITY = "custom_personality"
+CONFIG_KEY_KOBOLD_PROMPT = "kobold_system_prompt"
 
 # Cache instance genai.Client per API key
 _gemini_clients: Dict[str, genai.Client] = {}
@@ -384,8 +423,16 @@ def get_effective_prompts() -> Tuple[str, str, bool, bool]:
     )
 
 
+def get_kobold_system_prompt() -> Tuple[str, bool]:
+    """System prompt untuk KoboldCPP. Return: (prompt, is_custom)."""
+    custom = db.get_config(CONFIG_KEY_KOBOLD_PROMPT)
+    if custom is not None and custom.strip():
+        return custom, True
+    return DEFAULT_KOBOLD_SYSTEM_PROMPT, False
+
+
 def build_combined_system_instruction() -> str:
-    """Merakit gabungan System Prompt + Personality untuk dikirim ke Gemini & KoboldCPP."""
+    """Merakit gabungan System Prompt + Personality untuk dikirim ke Gemini."""
     sys_prompt, personality, _, _ = get_effective_prompts()
     return (
         f"[SYSTEM RULES & INSTRUCTIONS]\n{sys_prompt}\n\n"
@@ -457,6 +504,10 @@ def build_start_keyboard(has_proxy: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🔄 Refresh Status", callback_data="menu:start"),
         ],
     ]
+    if has_proxy:
+        keyboard.insert(
+            1, [InlineKeyboardButton("🧪 Tes KoboldCPP", callback_data="menu:koboldtest")]
+        )
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -549,6 +600,16 @@ def format_start_text(user_first_name: str, user_id: int) -> Tuple[str, bool]:
 
     prompt_badge = "Custom (DB)" if is_custom_p else "Default (Hardcoded)"
     persona_badge = "Custom (DB)" if is_custom_pers else "Default (Hardcoded)"
+    if proxy_url:
+        # Saat proxy aktif, hanya prompt KoboldCPP yang dikirim ke model
+        _, kobold_is_custom = get_kobold_system_prompt()
+        kobold_badge = "Custom (DB)" if kobold_is_custom else "Default (Roleplay)"
+        instruction_lines = f"└ Prompt KoboldCPP: <code>{kobold_badge}</code>\n\n"
+    else:
+        instruction_lines = (
+            f"└ System Prompt: <code>{prompt_badge}</code>\n"
+            f"└ Personality: <code>{persona_badge}</code>\n\n"
+        )
 
     text = (
         f"Halo, <b>{name}</b>! 👋\n"
@@ -556,10 +617,9 @@ def format_start_text(user_first_name: str, user_id: int) -> Tuple[str, bool]:
         f"📡 <b>Status Sistem Saat Ini:</b>\n"
         f"{backend_status}\n\n"
         f"🎭 <b>Instruksi Aktif:</b>\n"
-        f"└ System Prompt: <code>{prompt_badge}</code>\n"
-        f"└ Personality: <code>{persona_badge}</code>\n\n"
+        f"{instruction_lines}"
         f"💡 <b>Kirim teks, foto, atau dokumen (PDF/kode)</b> untuk langsung memulai.\n"
-        f"Perintah: /models • /thinking • /style • /setprompt • /setpersona • /resetstyle • /setproxy • /clearproxy • /reset"
+        f"Perintah: /models • /thinking • /style • /setprompt • /setpersona • /setkoboldprompt • /koboldtest • /resetstyle • /setproxy • /clearproxy • /reset"
     )
     return text, bool(proxy_url)
 
@@ -937,8 +997,8 @@ async def stream_kobold_proxy(
     history: List[Tuple[str, str]],
     user_text: str,
 ) -> AsyncGenerator[str, None]:
-    """Mengalirkan respons dari KoboldCPP Proxy dengan system prompt & personality aktif."""
-    messages = [{"role": "system", "content": build_combined_system_instruction()}]
+    """Mengalirkan respons dari KoboldCPP Proxy memakai system prompt khusus KoboldCPP."""
+    messages = [{"role": "system", "content": get_kobold_system_prompt()[0]}]
     for role, content in history:
         messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": user_text})
@@ -946,7 +1006,7 @@ async def stream_kobold_proxy(
     payload = {
         "model": "koboldcpp",
         "messages": messages,
-        "temperature": 0.75,
+        "temperature": KOBOLD_TEMPERATURE,
         "max_tokens": 1024,
         "stream": True,
     }
@@ -970,6 +1030,262 @@ async def stream_kobold_proxy(
                 raise value
     finally:
         await worker_task
+
+
+# ==============================================================================
+# 6b. TES KOBOLDCPP (KONEKSI & KEPATUHAN)
+# ==============================================================================
+def kobold_base_url(proxy_url: str) -> str:
+    """Ubah endpoint chat completions menjadi base URL server KoboldCPP."""
+    url = proxy_url.strip().rstrip("/")
+    for suffix in ("/v1/chat/completions", "/v1"):
+        if url.endswith(suffix):
+            return url[: -len(suffix)]
+    return url
+
+
+def detect_refusal(text: str) -> Optional[str]:
+    """Kembalikan penanda penolakan pertama yang ditemukan, atau None."""
+    lowered = (text or "").lower().replace("’", "'")
+    for marker in REFUSAL_MARKERS:
+        if marker in lowered:
+            return marker
+    return None
+
+
+def evaluate_probe(text: str, expect: Optional[str]) -> Tuple[str, str]:
+    """Return (emoji, penjelasan) untuk balasan tes kepatuhan."""
+    if not (text or "").strip():
+        return "❌", "Balasan kosong."
+    marker = detect_refusal(text)
+    if marker:
+        return "⚠️", f"Terindikasi menolak / keluar karakter (penanda: \u00ab{marker}\u00bb)."
+    if expect and expect.lower() not in text.lower():
+        return "🟡", f"Tidak menolak, tetapi instruksi tidak diikuti (kata {expect} tidak muncul)."
+    if expect:
+        return "✅", "Patuh: tidak ada tanda penolakan dan instruksi diikuti."
+    return "✅", "Tidak ada tanda penolakan pada balasan."
+
+
+def _kobold_ping_sync(proxy_url: str) -> Dict[str, Any]:
+    """Tes koneksi: coba /api/v1/model lalu /v1/models. Return ok/model/latency_ms/detail."""
+    base = kobold_base_url(proxy_url)
+    probes = (
+        ("/api/v1/model", lambda data: data.get("result")),
+        ("/v1/models", lambda data: ((data.get("data") or [{}])[0]).get("id")),
+    )
+    detail = "Tidak ada endpoint KoboldCPP yang merespons."
+
+    for path, extract in probes:
+        started = time.monotonic()
+        try:
+            resp = requests.get(base + path, timeout=KOBOLD_PING_TIMEOUT_SECONDS)
+        except requests.exceptions.Timeout:
+            return {
+                "ok": False, "model": None, "latency_ms": None,
+                "detail": f"Timeout setelah {KOBOLD_PING_TIMEOUT_SECONDS} dtk (server mati atau sibuk).",
+            }
+        except requests.exceptions.RequestException as exc:
+            return {
+                "ok": False, "model": None, "latency_ms": None,
+                "detail": f"Tidak bisa terhubung ({type(exc).__name__}). Periksa URL & tunnel.",
+            }
+
+        latency_ms = int((time.monotonic() - started) * 1000)
+        status = resp.status_code
+        if status == 200:
+            try:
+                model = extract(resp.json())
+            except (ValueError, AttributeError, TypeError, IndexError):
+                model = None
+            return {"ok": True, "model": model, "latency_ms": latency_ms, "detail": f"HTTP 200 via {path}"}
+        if status in (502, 503, 504, 530):
+            return {
+                "ok": False, "model": None, "latency_ms": latency_ms,
+                "detail": f"HTTP {status}: tunnel/server tidak merespons. Pastikan KoboldCPP dan tunnel Cloudflare masih berjalan.",
+            }
+        if status in (401, 403):
+            return {
+                "ok": False, "model": None, "latency_ms": latency_ms,
+                "detail": f"HTTP {status}: akses ditolak (periksa autentikasi/API key server).",
+            }
+        detail = f"HTTP {status} pada {path}"
+
+    return {"ok": False, "model": None, "latency_ms": None, "detail": detail}
+
+
+def _kobold_probe_sync(proxy_url: str, user_text: str) -> Dict[str, Any]:
+    """
+    Kirim 1 pesan uji (tanpa riwayat) dengan system prompt Kobold aktif, memakai format
+    payload yang sama dengan chat biasa (non-streaming agar timeout tegas).
+    Return: ok/text/latency_ms/error.
+    """
+    payload = {
+        "model": "koboldcpp",
+        "messages": [
+            {"role": "system", "content": get_kobold_system_prompt()[0]},
+            {"role": "user", "content": user_text},
+        ],
+        "temperature": KOBOLD_TEMPERATURE,
+        "max_tokens": KOBOLD_PROBE_MAX_TOKENS,
+        "stream": False,
+    }
+    started = time.monotonic()
+    try:
+        resp = requests.post(
+            proxy_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=KOBOLD_PROBE_TIMEOUT_SECONDS,
+        )
+    except requests.exceptions.Timeout:
+        return {"ok": False, "text": "", "latency_ms": None,
+                "error": f"Timeout setelah {KOBOLD_PROBE_TIMEOUT_SECONDS} dtk."}
+    except requests.exceptions.RequestException as exc:
+        return {"ok": False, "text": "", "latency_ms": None,
+                "error": f"Tidak bisa terhubung ({type(exc).__name__})."}
+
+    latency_ms = int((time.monotonic() - started) * 1000)
+    if resp.status_code != 200:
+        return {"ok": False, "text": "", "latency_ms": latency_ms,
+                "error": f"HTTP {resp.status_code}: {str(resp.text)[:200]}"}
+    try:
+        choices = resp.json().get("choices") or []
+        first = choices[0] if choices else {}
+        text = (first.get("message") or {}).get("content") or first.get("text") or ""
+    except (ValueError, AttributeError, TypeError, IndexError):
+        return {"ok": False, "text": "", "latency_ms": latency_ms,
+                "error": "Respons bukan format chat completions yang valid."}
+    return {"ok": True, "text": str(text), "latency_ms": latency_ms, "error": None}
+
+
+def build_koboldtest_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔌 Tes Koneksi", callback_data="kobold:ping")],
+            [InlineKeyboardButton("💬 Tes Kepatuhan (kirim pesan uji)", callback_data="kobold:probe")],
+            [InlineKeyboardButton("⬅️ Kembali ke Menu", callback_data="menu:start")],
+        ]
+    )
+
+
+def format_koboldtest_menu() -> str:
+    proxy_url = db.get_config(CONFIG_KEY_PROXY_URL)
+    _, is_custom = get_kobold_system_prompt()
+    status = "Custom (DB)" if is_custom else "Default (Roleplay)"
+    endpoint = html.escape(proxy_url) if proxy_url else "belum diatur"
+    return (
+        "🧪 <b>Tes KoboldCPP</b>\n"
+        f"└ Endpoint: <code>{endpoint}</code>\n"
+        f"└ Prompt Kobold: <code>{status}</code>\n\n"
+        "• <b>Tes Koneksi</b>: cek server/tunnel hidup dan model yang termuat.\n"
+        "• <b>Tes Kepatuhan</b>: kirim pesan uji roleplay lewat jalur yang sama dengan chat "
+        "(tanpa riwayat), lalu periksa tanda penolakan.\n\n"
+        "<i>Uji skenariomu sendiri: <code>/koboldtest &lt;pesan&gt;</code></i>"
+    )
+
+
+def format_ping_report(result: Dict[str, Any], proxy_url: str) -> str:
+    base = html.escape(kobold_base_url(proxy_url))
+    if result["ok"]:
+        model = html.escape(str(result.get("model") or "tidak diketahui"))
+        return (
+            "✅ <b>KoboldCPP terhubung</b>\n"
+            f"└ Server: <code>{base}</code>\n"
+            f"└ Model: <code>{model}</code>\n"
+            f"└ Latensi: <code>{result['latency_ms']} ms</code>\n"
+            f"└ {html.escape(result['detail'])}"
+        )
+    return (
+        "❌ <b>Gagal terhubung ke KoboldCPP</b>\n"
+        f"└ Server: <code>{base}</code>\n"
+        f"└ {html.escape(result['detail'])}"
+    )
+
+
+def format_probe_report(result: Dict[str, Any], test_text: str, expect: Optional[str]) -> str:
+    if not result["ok"]:
+        return f"❌ <b>Tes Kepatuhan gagal</b>\n└ {html.escape(result['error'])}"
+
+    _, is_custom = get_kobold_system_prompt()
+    status = "Custom (DB)" if is_custom else "Default (Roleplay)"
+    emoji, explanation = evaluate_probe(result["text"], expect)
+    reply = result["text"].strip()
+    if len(reply) > 800:
+        reply = reply[:800] + "…"
+    return (
+        f"{emoji} <b>Hasil Tes Kepatuhan</b>\n"
+        f"└ Prompt Kobold: <code>{status}</code>\n"
+        f"└ Waktu respons: <code>{result['latency_ms'] / 1000:.1f} dtk</code>\n\n"
+        f"<b>Pesan uji:</b>\n<code>{html.escape(test_text[:300])}</code>\n\n"
+        f"<b>Balasan model:</b>\n<pre>{html.escape(reply) or '(kosong)'}</pre>\n\n"
+        f"{html.escape(explanation)}\n"
+        "<i>Penilaian otomatis hanya heuristik; baca balasannya untuk memastikan.</i>"
+    )
+
+
+async def _handle_koboldtest_callback(query: Any, user_id: int, data: str) -> None:
+    keyboard = build_koboldtest_keyboard()
+
+    async def _edit(text: str) -> None:
+        await query.edit_message_text(
+            text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard
+        )
+
+    if not is_authorized_admin(user_id):
+        await _edit("⛔ Tes KoboldCPP hanya untuk Admin.")
+        return
+    if data == "menu:koboldtest":
+        await _edit(format_koboldtest_menu())
+        return
+
+    proxy_url = db.get_config(CONFIG_KEY_PROXY_URL)
+    if not proxy_url:
+        await _edit(
+            "⚠️ Belum ada proxy. Atur dengan <code>/setproxy https://xxx.trycloudflare.com</code>."
+        )
+        return
+
+    if data == "kobold:ping":
+        await _edit("⏳ Menguji koneksi ke KoboldCPP...")
+        result = await asyncio.to_thread(_kobold_ping_sync, proxy_url)
+        await _edit(format_ping_report(result, proxy_url))
+    else:  # kobold:probe
+        await _edit("⏳ Mengirim pesan uji (model 24B bisa butuh 10–60 dtk)...")
+        result = await asyncio.to_thread(_kobold_probe_sync, proxy_url, KOBOLD_PROBE_TEXT)
+        await _edit(format_probe_report(result, KOBOLD_PROBE_TEXT, KOBOLD_PROBE_EXPECT))
+
+
+async def koboldtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/koboldtest -> menu tombol; /koboldtest <pesan> -> uji skenario sendiri."""
+    user_id = update.effective_user.id
+    if not is_authorized_admin(user_id):
+        await update.effective_message.reply_text("⛔ Hanya Admin yang diizinkan menjalankan tes ini.")
+        return
+
+    raw_text = (update.effective_message.text or "").split(maxsplit=1)
+    if len(raw_text) < 2 or not raw_text[1].strip():
+        await update.effective_message.reply_text(
+            format_koboldtest_menu(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_koboldtest_keyboard(),
+        )
+        return
+
+    proxy_url = db.get_config(CONFIG_KEY_PROXY_URL)
+    if not proxy_url:
+        await update.effective_message.reply_text(
+            "⚠️ Belum ada proxy. Atur dengan <code>/setproxy https://xxx.trycloudflare.com</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    custom_text = raw_text[1].strip()
+    status_message = await update.effective_message.reply_text("⏳ Mengirim pesan uji...")
+    result = await asyncio.to_thread(_kobold_probe_sync, proxy_url, custom_text)
+    await status_message.edit_text(
+        format_probe_report(result, custom_text, None), parse_mode=ParseMode.HTML
+    )
 
 
 # ==============================================================================
@@ -1186,6 +1502,8 @@ async def style_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     sys_prompt, personality, is_custom_p, is_custom_pers = get_effective_prompts()
     p_status = "Custom (DB Overwrite)" if is_custom_p else "Default (Hardcoded)"
     pers_status = "Custom (DB Overwrite)" if is_custom_pers else "Default (Hardcoded)"
+    kobold_prompt, kobold_custom = get_kobold_system_prompt()
+    kobold_status = "Custom (DB Overwrite)" if kobold_custom else "Default (Roleplay)"
 
     text = (
         f"🎭 <b>Konfigurasi System Prompt &amp; Personality</b>\n\n"
@@ -1193,10 +1511,13 @@ async def style_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"<code>{html.escape(sys_prompt)}</code>\n\n"
         f"🗣 <b>Personality</b> [<i>{pers_status}</i>]:\n"
         f"<code>{html.escape(personality)}</code>\n\n"
+        f"🔌 <b>Prompt KoboldCPP</b> [<i>{kobold_status}</i>]:\n"
+        f"<code>{html.escape(kobold_prompt)}</code>\n\n"
         f"🛠 <b>Cara Mengubah:</b>\n"
-        f"• <code>/setprompt &lt;instruksi baru&gt;</code>\n"
-        f"• <code>/setpersona &lt;gaya bicara baru&gt;</code>\n"
-        f"• <code>/resetstyle</code> — Kembalikan keduanya ke default hardcoded"
+        f"• <code>/setprompt &lt;instruksi baru&gt;</code> (Gemini)\n"
+        f"• <code>/setpersona &lt;gaya bicara baru&gt;</code> (Gemini)\n"
+        f"• <code>/setkoboldprompt &lt;prompt roleplay&gt;</code> (KoboldCPP)\n"
+        f"• <code>/resetstyle</code> — Kembalikan semuanya ke default"
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -1224,7 +1545,7 @@ async def setprompt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.effective_message.reply_text(
         f"✅ <b>System Prompt berhasil diperbarui (menimpa default)!</b>\n"
         f"<code>{html.escape(new_prompt)}</code>\n\n"
-        f"<i>Berlaku untuk Gemini &amp; KoboldCPP. Gunakan /resetstyle untuk kembali ke default.</i>",
+        f"<i>Berlaku untuk Gemini. Untuk KoboldCPP gunakan /setkoboldprompt. /resetstyle mengembalikan default.</i>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1252,7 +1573,7 @@ async def setpersona_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.effective_message.reply_text(
         f"✅ <b>Personality berhasil diperbarui (menimpa default)!</b>\n"
         f"<code>{html.escape(new_persona)}</code>\n\n"
-        f"<i>Berlaku untuk Gemini &amp; KoboldCPP. Gunakan /resetstyle untuk kembali ke default.</i>",
+        f"<i>Berlaku untuk Gemini. Untuk KoboldCPP gunakan /setkoboldprompt. /resetstyle mengembalikan default.</i>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1268,9 +1589,51 @@ async def resetstyle_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     db.delete_config(CONFIG_KEY_SYSTEM_PROMPT)
     db.delete_config(CONFIG_KEY_PERSONALITY)
+    db.delete_config(CONFIG_KEY_KOBOLD_PROMPT)
     await update.effective_message.reply_text(
-        "🧹 <b>System Prompt &amp; Personality dikembalikan ke default hardcoded!</b>\n"
+        "🧹 <b>System Prompt, Personality &amp; Prompt KoboldCPP dikembalikan ke default!</b>\n"
         "Ketik /style untuk memeriksa detailnya.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def setkoboldprompt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/setkoboldprompt <teks> -> set; /setkoboldprompt reset -> default; tanpa argumen -> tampilkan."""
+    user_id = update.effective_user.id
+    if not is_authorized_admin(user_id):
+        await update.effective_message.reply_text(
+            "⛔ Hanya Admin yang diizinkan mengubah Prompt KoboldCPP."
+        )
+        return
+
+    raw_text = (update.effective_message.text or "").split(maxsplit=1)
+    if len(raw_text) < 2 or not raw_text[1].strip():
+        current, is_custom = get_kobold_system_prompt()
+        status = "Custom (DB Overwrite)" if is_custom else "Default (Roleplay)"
+        await update.effective_message.reply_text(
+            f"🔌 <b>Prompt KoboldCPP</b> [<i>{status}</i>]:\n"
+            f"<code>{html.escape(current)}</code>\n\n"
+            "Format: <code>/setkoboldprompt You are Nera, a roleplay partner...</code>\n"
+            "Kembali ke default: <code>/setkoboldprompt reset</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    argument = raw_text[1].strip()
+    if argument.lower() == "reset":
+        db.delete_config(CONFIG_KEY_KOBOLD_PROMPT)
+        await update.effective_message.reply_text(
+            "🧹 <b>Prompt KoboldCPP dikembalikan ke default (roleplay).</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    db.set_config(CONFIG_KEY_KOBOLD_PROMPT, argument)
+    await update.effective_message.reply_text(
+        f"✅ <b>Prompt KoboldCPP diperbarui!</b>\n"
+        f"<code>{html.escape(argument)}</code>\n\n"
+        "<i>Jalankan /reset agar riwayat chat lama (termasuk balasan yang menolak) "
+        "tidak ikut terkirim sebagai konteks.</i>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1381,6 +1744,9 @@ async def callback_query_handler(
                 reply_markup=build_models_keyboard(target_mode),
             )
 
+        elif data in ("menu:koboldtest", "kobold:ping", "kobold:probe"):
+            await _handle_koboldtest_callback(query, user_id, data)
+
         elif data == "menu:thinking":
             active = db.get_user_thinking_mode(user_id)
             await query.edit_message_text(
@@ -1405,13 +1771,18 @@ async def callback_query_handler(
             sys_prompt, personality, is_custom_p, is_custom_pers = get_effective_prompts()
             p_status = "Custom (DB)" if is_custom_p else "Hardcoded"
             pers_status = "Custom (DB)" if is_custom_pers else "Hardcoded"
+            kobold_prompt, kobold_custom = get_kobold_system_prompt()
+            kobold_status = "Custom (DB)" if kobold_custom else "Default (Roleplay)"
             text = (
                 f"🎭 <b>Prompt &amp; Personality Aktif</b>\n\n"
                 f"📌 <b>System Prompt</b> [<i>{p_status}</i>]:\n"
                 f"<code>{html.escape(sys_prompt[:400])}</code>\n\n"
                 f"🗣 <b>Personality</b> [<i>{pers_status}</i>]:\n"
                 f"<code>{html.escape(personality[:400])}</code>\n\n"
-                f"Gunakan <code>/setprompt</code>, <code>/setpersona</code>, atau <code>/resetstyle</code>."
+                f"🔌 <b>Prompt KoboldCPP</b> [<i>{kobold_status}</i>]:\n"
+                f"<code>{html.escape(kobold_prompt[:400])}</code>\n\n"
+                f"Gunakan <code>/setprompt</code>, <code>/setpersona</code>, "
+                f"<code>/setkoboldprompt</code>, atau <code>/resetstyle</code>."
             )
             back_markup = InlineKeyboardMarkup(
                 [[InlineKeyboardButton("⬅️ Kembali ke Menu", callback_data="menu:start")]]
@@ -1748,6 +2119,8 @@ async def post_init_setup(application: Application) -> None:
         BotCommand("style", "Lihat System Prompt & Personality aktif"),
         BotCommand("setprompt", "Timpa System Prompt default (/setprompt <teks>)"),
         BotCommand("setpersona", "Timpa Personality default (/setpersona <teks>)"),
+        BotCommand("setkoboldprompt", "Prompt khusus KoboldCPP (/setkoboldprompt <teks|reset>)"),
+        BotCommand("koboldtest", "Tes koneksi & kepatuhan KoboldCPP (/koboldtest [pesan])"),
         BotCommand("resetstyle", "Kembalikan System Prompt & Personality ke default"),
         BotCommand("setproxy", "Aktifkan KoboldCPP Proxy (/setproxy <url>)"),
         BotCommand("clearproxy", "Hapus proxy & kembali ke Gemini"),
@@ -1781,6 +2154,8 @@ def main() -> None:
     application.add_handler(CommandHandler("style", style_command))
     application.add_handler(CommandHandler("setprompt", setprompt_command))
     application.add_handler(CommandHandler("setpersona", setpersona_command))
+    application.add_handler(CommandHandler("setkoboldprompt", setkoboldprompt_command))
+    application.add_handler(CommandHandler("koboldtest", koboldtest_command))
     application.add_handler(CommandHandler("resetstyle", resetstyle_command))
     application.add_handler(CommandHandler("setproxy", setproxy_command))
     application.add_handler(CommandHandler("clearproxy", clearproxy_command))
